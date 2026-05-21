@@ -220,8 +220,9 @@ model = AutoModelForSpeechSeq2Seq.from_pretrained(
     attn_implementation="eager",
 ).eval().requires_grad_(False)
 
-# Enable static cache for torch.compile compatibility
-model.generation_config.cache_implementation = "static"
+# Do NOT set cache_implementation="static" — it triggers implicit torch.compile
+# with the default Inductor backend which doesn't support neuron device.
+# Our per-layer torch.compile(backend='neuron') handles compilation.
 model.generation_config.max_new_tokens = 256
 
 # Update config for sharded heads
