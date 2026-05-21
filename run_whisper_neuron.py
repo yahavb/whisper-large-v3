@@ -234,13 +234,16 @@ if rank == 0:
     print(f"  Decoder layers: {len(model.model.decoder.layers)}")
     print(f"  Static cache enabled, max_new_tokens=256")
 
-# Shard encoder layers
+# Shard encoder layers and patch num_heads
 for i, layer in enumerate(model.model.encoder.layers):
     shard_encoder_layer(layer, rank, TP)
+    layer.self_attn.num_heads = model.config.encoder_attention_heads
 
-# Shard decoder layers
+# Shard decoder layers and patch num_heads
 for i, layer in enumerate(model.model.decoder.layers):
     shard_decoder_layer(layer, rank, TP)
+    layer.self_attn.num_heads = model.config.decoder_attention_heads
+    layer.encoder_attn.num_heads = model.config.decoder_attention_heads
 
 # Shard proj_out (lm_head equivalent) — column parallel
 proj_out = model.proj_out
