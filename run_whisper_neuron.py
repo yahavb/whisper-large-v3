@@ -354,7 +354,7 @@ test_samples = torch.load(AUDIO_INPUTS_PATH, weights_only=False)
 if rank == 0:
     print(f"\n[STEP 4] Warmup run (triggers compilation)...")
 
-warmup_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
+warmup_inputs = {k: v.to(dtype=torch.bfloat16, device=NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
                  for k, v in test_samples[0]["inputs"].items()}
 
 warmup_start = time.time()
@@ -390,7 +390,7 @@ for run_idx in range(NUM_RUNS):
     # Cycle through test samples
     sample_idx = run_idx % len(test_samples)
     sample = test_samples[sample_idx]
-    inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
+    inputs = {k: v.to(dtype=torch.bfloat16, device=NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
               for k, v in sample["inputs"].items()}
     ground_truth = sample["ground_truth"]
 
