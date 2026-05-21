@@ -2,6 +2,7 @@
 
 Tensor-parallel inference using torch.compile(backend='neuron').
 Demonstrates: compile once → reuse for multiple audio inputs.
+Validates output against ground-truth transcriptions using WER.
 
 Architecture: Encoder-Decoder (speech-to-text)
   - 32 encoder layers (self-attention + MLP)
@@ -13,7 +14,6 @@ Architecture: Encoder-Decoder (speech-to-text)
 import os
 import sys
 import time
-import tempfile
 
 import torch
 import torch.nn as nn
@@ -182,6 +182,7 @@ if rank == 0:
     print(f"  Whisper-large-v3 — PyTorch Native on Neuron (TP-{TP})")
     print(f"  World size: {world_size}")
     print(f"  Compile once → reuse for multiple audio inputs")
+    print(f"  Validation: WER against ground-truth transcriptions")
     print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -190,16 +191,20 @@ if rank == 0:
 if rank == 0:
     print(f"\n[STEP 1] Loading Whisper-large-v3 on CPU and sharding for TP-{TP}...")
 
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/whisper-large-v3")
-processor = WhisperProcessor.from_pretrained(MODEL_PATH)
+processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-model = WhisperForConditionalGeneration.from_pretrained(
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
     attn_implementation="eager",
 ).eval().requires_grad_(False)
+
+# Enable static cache for torch.compile compatibility
+model.generation_config.cache_implementation = "static"
+model.generation_config.max_new_tokens = 256
 
 # Update config for sharded heads
 model.config.encoder_attention_heads = model.config.encoder_attention_heads // TP
@@ -209,6 +214,7 @@ if rank == 0:
     print(f"  Original: 20 heads → {model.config.encoder_attention_heads} heads/rank")
     print(f"  Encoder layers: {len(model.model.encoder.layers)}")
     print(f"  Decoder layers: {len(model.model.decoder.layers)}")
+    print(f"  Static cache enabled, max_new_tokens=256")
 
 # Shard encoder layers
 for i, layer in enumerate(model.model.encoder.layers):
@@ -245,7 +251,6 @@ model = model.to(NEURON_DEVICE)
 # Compile encoder layers
 for layer in model.model.encoder.layers:
     layer.self_attn = torch.compile(layer.self_attn, backend='neuron', dynamic=False)
-    # Compile fc1+fc2 as a unit via the layer forward
     layer.fc1 = torch.compile(layer.fc1, backend='neuron', dynamic=False)
     layer.fc2 = torch.compile(layer.fc2, backend='neuron', dynamic=False)
 
@@ -276,48 +281,45 @@ if rank == 0:
     print(f"  TP-{TP} setup complete!")
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 3: Prepare audio inputs
+# STEP 3: Load test dataset with ground-truth transcriptions
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print(f"\n[STEP 3] Preparing audio inputs...")
+    print(f"\n[STEP 3] Loading test dataset (distil-whisper/librispeech_long)...")
 
-import urllib.request
-import io
-
-# Sample audio URLs (LibriSpeech samples hosted publicly)
-AUDIO_URLS = [
-    "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac",
-    "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/2.flac",
-]
-
-AUDIO_INPUTS_PATH = "/tmp/whisper_inputs.pt"
+AUDIO_INPUTS_PATH = "/tmp/whisper_test_inputs.pt"
 
 if rank == 0:
-    import librosa
+    from datasets import load_dataset
 
-    all_inputs = []
-    for i, url in enumerate(AUDIO_URLS):
-        print(f"  Downloading audio {i+1}: {url}")
-        audio_path = f"/tmp/audio_sample_{i}.flac"
-        urllib.request.urlretrieve(url, audio_path)
+    # Load LibriSpeech long-form audio with ground-truth text
+    dataset = load_dataset("distil-whisper/librispeech_long", "clean", split="validation")
 
-        # Load audio at 16kHz (Whisper's expected sample rate)
-        audio, sr = librosa.load(audio_path, sr=16000)
-        print(f"    Duration: {len(audio)/sr:.2f}s, samples: {len(audio)}")
+    # Prepare multiple test samples
+    test_samples = []
+    num_samples = min(3, len(dataset))
+    for i in range(num_samples):
+        sample = dataset[i]
+        audio = sample["audio"]
+        print(f"  Sample {i+1}: {audio['sampling_rate']}Hz, "
+              f"{len(audio['array'])/audio['sampling_rate']:.1f}s")
+        print(f"    Ground truth: {sample['text'][:100]}...")
 
-        # Process through Whisper processor
+        # Process audio through Whisper processor
         inputs = processor(
-            audio,
-            sampling_rate=16000,
+            audio["array"],
+            sampling_rate=audio["sampling_rate"],
             return_tensors="pt",
         )
-        all_inputs.append(inputs)
+        test_samples.append({
+            "inputs": inputs,
+            "ground_truth": sample["text"],
+        })
 
-    torch.save(all_inputs, AUDIO_INPUTS_PATH)
-    print(f"  Saved {len(all_inputs)} processed inputs")
+    torch.save(test_samples, AUDIO_INPUTS_PATH)
+    print(f"  Prepared {len(test_samples)} test samples with ground-truth")
 
 dist.barrier()
-all_inputs = torch.load(AUDIO_INPUTS_PATH, weights_only=False)
+test_samples = torch.load(AUDIO_INPUTS_PATH, weights_only=False)
 
 # ═══════════════════════════════════════════════════════════════════════
 # STEP 4: Warmup run (triggers compilation)
@@ -326,13 +328,13 @@ if rank == 0:
     print(f"\n[STEP 4] Warmup run (triggers compilation)...")
 
 warmup_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
-                 for k, v in all_inputs[0].items()}
+                 for k, v in test_samples[0]["inputs"].items()}
 
 warmup_start = time.time()
 with torch.no_grad():
     generated_ids = model.generate(
         **warmup_inputs,
-        max_new_tokens=128,
+        max_new_tokens=256,
         language="en",
         task="transcribe",
     )
@@ -341,32 +343,36 @@ warmup_time = time.time() - warmup_start
 if rank == 0:
     transcription = processor.batch_decode(generated_ids.cpu(), skip_special_tokens=True)[0]
     print(f"  Warmup time: {warmup_time:.2f}s (includes compilation)")
-    print(f"  Transcription: {transcription[:200]}")
+    print(f"  Transcription: {transcription[:150]}...")
 
 dist.barrier()
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 5: Timed runs (should reuse compiled graph)
+# STEP 5: Timed runs with WER validation
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print(f"\n[STEP 5] Timed inference runs (cached compilation)...")
+    print(f"\n[STEP 5] Timed inference runs with WER validation...")
     print("=" * 60)
+    from jiwer import wer as compute_wer
 
 NUM_RUNS = 5
 run_times = []
+wer_scores = []
 
 for run_idx in range(NUM_RUNS):
-    # Alternate between audio samples
-    audio_idx = run_idx % len(all_inputs)
+    # Cycle through test samples
+    sample_idx = run_idx % len(test_samples)
+    sample = test_samples[sample_idx]
     inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v
-              for k, v in all_inputs[audio_idx].items()}
+              for k, v in sample["inputs"].items()}
+    ground_truth = sample["ground_truth"]
 
     dist.barrier()
     start = time.time()
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=128,
+            max_new_tokens=256,
             language="en",
             task="transcribe",
         )
@@ -375,9 +381,18 @@ for run_idx in range(NUM_RUNS):
 
     if rank == 0:
         transcription = processor.batch_decode(generated_ids.cpu(), skip_special_tokens=True)[0]
+
+        # Compute WER
+        error_rate = compute_wer(ground_truth.lower(), transcription.lower())
+        wer_scores.append(error_rate)
+
         cached = "✅ cached" if elapsed < warmup_time * 0.5 else "⚠️ possible recompile"
-        print(f"\n  [RUN {run_idx+1}/{NUM_RUNS}] Audio {audio_idx+1} — {elapsed:.2f}s {cached}")
-        print(f"    Transcription: {transcription[:150]}")
+        wer_status = "✅ PASS" if error_rate < 0.10 else "⚠️ HIGH WER" if error_rate < 0.25 else "❌ FAIL"
+
+        print(f"\n  [RUN {run_idx+1}/{NUM_RUNS}] Sample {sample_idx+1} — {elapsed:.2f}s {cached}")
+        print(f"    Expected: {ground_truth[:120]}...")
+        print(f"    Got:      {transcription[:120]}...")
+        print(f"    WER:      {error_rate:.2%} {wer_status}")
 
     dist.barrier()
 
@@ -386,18 +401,40 @@ for run_idx in range(NUM_RUNS):
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
     avg_time = sum(run_times) / len(run_times)
+    avg_wer = sum(wer_scores) / len(wer_scores)
+    all_cached = all(t < warmup_time * 0.5 for t in run_times)
+    all_pass = all(w < 0.10 for w in wer_scores)
+
     print("\n" + "=" * 60)
     print("  FINAL SUMMARY — Whisper-large-v3 on Neuron")
     print("=" * 60)
-    print(f"  Model:       openai/whisper-large-v3")
-    print(f"  Backend:     torch.compile(backend='neuron', dynamic=False)")
-    print(f"  TP:          {TP}")
-    print(f"  Warmup:      {warmup_time:.2f}s (includes compilation)")
-    print(f"  Run times:   {[f'{t:.2f}s' for t in run_times]}")
-    print(f"  Average:     {avg_time:.2f}s")
-    print(f"  Speedup:     {warmup_time/avg_time:.1f}x vs warmup")
-    all_cached = all(t < warmup_time * 0.5 for t in run_times)
-    print(f"  All cached:  {'✅ YES' if all_cached else '❌ NO (recompilation detected)'}")
+    print(f"  Model:        openai/whisper-large-v3")
+    print(f"  Backend:      torch.compile(backend='neuron', dynamic=False)")
+    print(f"  TP:           {TP}")
+    print(f"  Static cache: enabled")
+    print(f"")
+    print(f"  ── Performance ──")
+    print(f"  Warmup:       {warmup_time:.2f}s (includes compilation)")
+    print(f"  Run times:    {[f'{t:.2f}s' for t in run_times]}")
+    print(f"  Average:      {avg_time:.2f}s")
+    print(f"  Speedup:      {warmup_time/avg_time:.1f}x vs warmup")
+    print(f"  All cached:   {'✅ YES' if all_cached else '❌ NO (recompilation detected)'}")
+    print(f"")
+    print(f"  ── Accuracy (WER) ──")
+    print(f"  WER scores:   {[f'{w:.2%}' for w in wer_scores]}")
+    print(f"  Average WER:  {avg_wer:.2%}")
+    print(f"  All < 10%:    {'✅ PASS' if all_pass else '❌ FAIL'}")
+    print(f"  Threshold:    10% WER (expected for Whisper large-v3 on LibriSpeech)")
+    print(f"")
+
+    if all_cached and all_pass:
+        print("  ✅ SUCCESS: Accurate transcription + cached compilation confirmed!")
+    elif all_pass:
+        print("  ⚠️  Transcription accurate but some recompilations detected")
+    elif all_cached:
+        print("  ⚠️  Compilation cached but WER higher than expected")
+    else:
+        print("  ❌ Issues with both caching and accuracy")
     print("=" * 60)
 
 dist.destroy_process_group()
