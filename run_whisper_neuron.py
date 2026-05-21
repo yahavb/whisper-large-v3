@@ -262,30 +262,14 @@ if rank == 0:
     print(f"  proj_out: {vocab_size} vocab → {chunk_size}/rank")
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 2: Move to Neuron + Compile + Wrap with TP
+# STEP 2: Move to Neuron + Wrap TP + Compile full layers
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print(f"\n[STEP 2] Moving to Neuron and compiling...")
+    print(f"\n[STEP 2] Moving to Neuron, wrapping TP, and compiling...")
 
 model = model.to(NEURON_DEVICE)
 
-# Compile encoder layers
-for layer in model.model.encoder.layers:
-    layer.self_attn = torch.compile(layer.self_attn, backend='neuron', dynamic=False)
-    layer.fc1 = torch.compile(layer.fc1, backend='neuron', dynamic=False)
-    layer.fc2 = torch.compile(layer.fc2, backend='neuron', dynamic=False)
-
-# Compile decoder layers
-for layer in model.model.decoder.layers:
-    layer.self_attn = torch.compile(layer.self_attn, backend='neuron', dynamic=False)
-    layer.encoder_attn = torch.compile(layer.encoder_attn, backend='neuron', dynamic=False)
-    layer.fc1 = torch.compile(layer.fc1, backend='neuron', dynamic=False)
-    layer.fc2 = torch.compile(layer.fc2, backend='neuron', dynamic=False)
-
-# Compile proj_out
-model.proj_out = torch.compile(model.proj_out, backend='neuron', dynamic=False)
-
-# Wrap with TP all_reduce/all_gather
+# Wrap with TP all_reduce/all_gather FIRST (before compile)
 for layer in model.model.encoder.layers:
     layer.self_attn = TPAttention(layer.self_attn)
     layer.fc2 = TPMLP(layer.fc2)
@@ -296,6 +280,17 @@ for layer in model.model.decoder.layers:
     layer.fc2 = TPMLP(layer.fc2)
 
 model.proj_out = TPProjOut(model.proj_out, TP)
+
+# Compile full encoder layers (includes layer norms + attention + MLP)
+for i, layer in enumerate(model.model.encoder.layers):
+    model.model.encoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
+
+# Compile full decoder layers (includes layer norms + self_attn + cross_attn + MLP)
+for i, layer in enumerate(model.model.decoder.layers):
+    model.model.decoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
+
+# Compile proj_out (with TP wrapper)
+model.proj_out = torch.compile(model.proj_out, backend='neuron', dynamic=False)
 
 dist.barrier()
 if rank == 0:
