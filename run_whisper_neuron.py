@@ -17,9 +17,15 @@ import time
 import urllib.request
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.distributed as dist
 import numpy as np
+
+# Increase recompile limit — Whisper decoder's past_key_values.is_updated
+# dictionary creates many guard states during autoregressive generation.
+# Default limit of 8 causes Dynamo to give up, breaking KV cache logic.
+torch._dynamo.config.cache_size_limit = 64
 
 
 # ═══════════════════════════════════════════════════════════════════════
