@@ -14,11 +14,29 @@ Architecture: Encoder-Decoder (speech-to-text)
 import os
 import sys
 import time
+import urllib.request
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import numpy as np
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test audio samples with known ground-truth transcriptions
+# From LibriSpeech test-clean (public domain)
+# ═══════════════════════════════════════════════════════════════════════
+
+TEST_SAMPLES = [
+    {
+        "url": "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac",
+        "ground_truth": "HE HOPED THERE WOULD BE STEW FOR DINNER TURNIPS AND CARROTS AND BRUISED POTATOES AND FAT MUTTON PIECES TO BE LADLED OUT IN THICK PEPPERED FLOUR FATTENED SAUCE",
+    },
+    {
+        "url": "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/2.flac",
+        "ground_truth": "STUFFILY FLOPPING ONTO THE MATS HAS THE GENTLEMAN BEEN MUCH INCONVENIENCED DURING THE NIGHT",
+    },
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -281,42 +299,51 @@ if rank == 0:
     print(f"  TP-{TP} setup complete!")
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 3: Load test dataset with ground-truth transcriptions
+# STEP 3: Download and prepare test audio (using soundfile, no torchcodec)
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print(f"\n[STEP 3] Loading test dataset (distil-whisper/librispeech_long)...")
+    print(f"\n[STEP 3] Downloading test audio files...")
 
 AUDIO_INPUTS_PATH = "/tmp/whisper_test_inputs.pt"
 
 if rank == 0:
-    from datasets import load_dataset
+    import soundfile as sf
 
-    # Load LibriSpeech long-form audio with ground-truth text
-    dataset = load_dataset("distil-whisper/librispeech_long", "clean", split="validation")
-
-    # Prepare multiple test samples
     test_samples = []
-    num_samples = min(3, len(dataset))
-    for i in range(num_samples):
-        sample = dataset[i]
-        audio = sample["audio"]
-        print(f"  Sample {i+1}: {audio['sampling_rate']}Hz, "
-              f"{len(audio['array'])/audio['sampling_rate']:.1f}s")
-        print(f"    Ground truth: {sample['text'][:100]}...")
+    for i, sample_info in enumerate(TEST_SAMPLES):
+        url = sample_info["url"]
+        ground_truth = sample_info["ground_truth"]
 
-        # Process audio through Whisper processor
+        # Download audio file
+        audio_path = f"/tmp/test_audio_{i}.flac"
+        print(f"  Downloading sample {i+1}: {url}")
+        urllib.request.urlretrieve(url, audio_path)
+
+        # Load audio at native sample rate using soundfile
+        audio_data, sample_rate = sf.read(audio_path, dtype='float32')
+        print(f"    Sample rate: {sample_rate}Hz, duration: {len(audio_data)/sample_rate:.2f}s")
+
+        # Resample to 16kHz if needed (Whisper expects 16kHz)
+        if sample_rate != 16000:
+            import librosa
+            audio_data = librosa.resample(audio_data, orig_sr=sample_rate, target_sr=16000)
+            sample_rate = 16000
+            print(f"    Resampled to 16kHz")
+
+        # Process through Whisper processor
         inputs = processor(
-            audio["array"],
-            sampling_rate=audio["sampling_rate"],
+            audio_data,
+            sampling_rate=16000,
             return_tensors="pt",
         )
         test_samples.append({
             "inputs": inputs,
-            "ground_truth": sample["text"],
+            "ground_truth": ground_truth,
         })
+        print(f"    Ground truth: {ground_truth[:80]}...")
 
     torch.save(test_samples, AUDIO_INPUTS_PATH)
-    print(f"  Prepared {len(test_samples)} test samples with ground-truth")
+    print(f"  Prepared {len(test_samples)} test samples")
 
 dist.barrier()
 test_samples = torch.load(AUDIO_INPUTS_PATH, weights_only=False)
