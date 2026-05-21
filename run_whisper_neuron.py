@@ -288,13 +288,15 @@ for layer in model.model.decoder.layers:
 
 model.proj_out = TPProjOut(model.proj_out, TP)
 
-# Compile full encoder layers (includes layer norms + attention + MLP)
+# Compile full encoder layers (fixed input shape — dynamic=False is fine)
 for i, layer in enumerate(model.model.encoder.layers):
     model.model.encoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
 
-# Compile full decoder layers (includes layer norms + self_attn + cross_attn + MLP)
+# Compile full decoder layers with dynamic=True — KV cache grows by 1 token
+# each decoding step, so the sequence dimension must be symbolic/dynamic.
+# With dynamic=False, each new cache size triggers a recompilation.
 for i, layer in enumerate(model.model.decoder.layers):
-    model.model.decoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
+    model.model.decoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=True)
 
 # Compile proj_out (with TP wrapper)
 model.proj_out = torch.compile(model.proj_out, backend='neuron', dynamic=False)

@@ -71,19 +71,36 @@ This line creates a TorchDynamo guard on the dictionary lookup result. Different
 
 ## Options to Fix
 
-### Option A: Increase `cache_size_limit` ⬅️ (Current attempt)
+### Option A: Increase `cache_size_limit` ❌ (Tried — doesn't fix)
 
 ```python
 torch._dynamo.config.cache_size_limit = 64
 ```
 
-**Rationale:** Allow Dynamo to compile and cache all the different guard state variants. Once all are compiled, the correct cached version is used for each call.
+**Result:** Still hits limit at 64. The REAL recompilation reason is:
+```
+tensor 'kwargs['past_key_values'].self_attention_cache.layers[30].keys' size mismatch at index 2. expected 4, actual 5
+```
+
+The KV cache tensor **grows by 1 token every decoding step**. This is NOT a finite set of states — it's unbounded. No `cache_size_limit` will fix this because each new sequence length requires a new compilation with `dynamic=False`.
+
+### Option A2: Use `dynamic=True` for decoder layers ⬅️ (Current attempt)
+
+```python
+# Encoder: fixed input shape, dynamic=False is fine
+model.model.encoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
+
+# Decoder: KV cache grows every step, must use dynamic=True
+model.model.decoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=True)
+```
+
+**Rationale:** `dynamic=True` tells TorchDynamo to treat tensor dimensions as symbolic, so a single compiled graph handles all sequence lengths without recompilation.
 
 **Tradeoffs:**
-- ✅ Simple one-line fix
-- ❌ Longer warmup (compiling up to 64 graph variants per layer)
-- ❌ More device memory for compiled graphs
-- ❓ May not cover all states if combinations exceed 64
+- ✅ Single compilation handles all sequence lengths
+- ✅ No recompilation limit issues
+- ❓ Depends on neuron backend supporting dynamic shapes
+- ❓ May have performance overhead from symbolic shape handling
 
 ### Option B: Compile encoder only, run decoder eagerly
 
