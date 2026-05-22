@@ -292,13 +292,13 @@ model.proj_out = TPProjOut(model.proj_out, TP)
 for i, layer in enumerate(model.model.encoder.layers):
     model.model.encoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=False)
 
-# Compile full decoder layers with dynamic=True — KV cache grows by 1 token
-# each decoding step, so the sequence dimension must be symbolic/dynamic.
-# With dynamic=False, each new cache size triggers a recompilation.
-for i, layer in enumerate(model.model.decoder.layers):
-    model.model.decoder.layers[i] = torch.compile(layer, backend='neuron', dynamic=True)
+# Decoder layers: DO NOT compile.
+# - dynamic=False: recompiles every decoding step (KV cache grows by 1 token)
+# - dynamic=True: Neuron backend doesn't support dynamic shapes
+#   ("stablehlo.broadcast_in_dim must be statically shaped, got tensor<1x?x1xf32>")
+# Decoder layers run eagerly on Neuron device with TP wrappers only.
 
-# Compile proj_out (with TP wrapper)
+# Compile proj_out (with TP wrapper) — fixed output shape per rank
 model.proj_out = torch.compile(model.proj_out, backend='neuron', dynamic=False)
 
 dist.barrier()

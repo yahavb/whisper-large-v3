@@ -84,7 +84,7 @@ tensor 'kwargs['past_key_values'].self_attention_cache.layers[30].keys' size mis
 
 The KV cache tensor **grows by 1 token every decoding step**. This is NOT a finite set of states — it's unbounded. No `cache_size_limit` will fix this because each new sequence length requires a new compilation with `dynamic=False`.
 
-### Option A2: Use `dynamic=True` for decoder layers ⬅️ (Current attempt)
+### Option A2: Use `dynamic=True` for decoder layers ❌ (Tried — Neuron rejects)
 
 ```python
 # Encoder: fixed input shape, dynamic=False is fine
